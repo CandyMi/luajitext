@@ -1,0 +1,92 @@
+diff --git a/src/Makefile b/src/Makefile
+index 0b8c04f7..5a22281c 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -527,7 +527,7 @@ LJCORE_O= lj_assert.o lj_gc.o lj_err.o lj_char.o lj_bc.o lj_obj.o lj_buf.o \
+ 	  lj_ctype.o lj_cdata.o lj_cconv.o lj_ccall.o lj_ccallback.o \
+ 	  lj_carith.o lj_clib.o lj_cparse.o \
+ 	  lj_lib.o lj_alloc.o lib_aux.o \
+-	  $(LJLIB_O) lib_init.o
++	  $(LJLIB_O) lib_init.o yyjson.o lib_ccjson.o lib_ccmsgpack.o
+ 
+ LJVMCORE_O= $(LJVM_O) $(LJCORE_O)
+ LJVMCORE_DYNO= $(LJVMCORE_O:.o=_dyn.o)
+@@ -734,6 +734,19 @@ $(HOST_O): %.o: %.c
+ 
+ include Makefile.dep
+ 
++# cc codecs: the module sources live in ../ext, not in src/. Bind the src
++# objects to the ext sources and replicate the generic %.o rule (which
++# produces both the static and the _dyn.o object).
++lib_ccjson.o yyjson.o: %.o: ../ext/%.c
++	$(E) "CC        $@"
++	$(Q)$(TARGET_DYNCC) $(TARGET_ACFLAGS) -I. -c -o $(@:.o=_dyn.o) $<
++	$(Q)$(TARGET_CC) $(TARGET_ACFLAGS) -I. -c -o $@ $<
++
++lib_ccmsgpack.o: ../ext/lib_ccmsgpack.c
++	$(E) "CC        $@"
++	$(Q)$(TARGET_DYNCC) $(TARGET_ACFLAGS) -I. -c -o $(@:.o=_dyn.o) $<
++	$(Q)$(TARGET_CC) $(TARGET_ACFLAGS) -I. -c -o $@ $<
++
+ ##############################################################################
+ # Target file rules.
+ ##############################################################################
+diff --git a/src/lib_init.c b/src/lib_init.c
+index fb8138f2..26eec9b7 100644
+--- a/src/lib_init.c
++++ b/src/lib_init.c
+@@ -33,6 +33,8 @@ static const luaL_Reg lj_lib_preload[] = {
+ #if LJ_HASFFI
+   { LUA_FFILIBNAME,	luaopen_ffi },
+ #endif
++  { "ccjson",		luaopen_ccjson },
++  { "ccmsgpack",		luaopen_ccmsgpack },
+   { NULL,		NULL }
+ };
+ 
+diff --git a/src/ljamalg.c b/src/ljamalg.c
+index 1dd96989..0bbae02f 100644
+--- a/src/ljamalg.c
++++ b/src/ljamalg.c
+@@ -88,4 +88,7 @@
+ #include "lib_ffi.c"
+ #include "lib_buffer.c"
+ #include "lib_init.c"
++#include "../ext/lib_ccjson.c"
++#include "../ext/lib_ccmsgpack.c"
++#include "../ext/yyjson.c"
+ 
+diff --git a/src/lualib.h b/src/lualib.h
+index f0d1642f..dec5ce2d 100644
+--- a/src/lualib.h
++++ b/src/lualib.h
+@@ -34,6 +34,8 @@ LUALIB_API int luaopen_bit(lua_State *L);
+ LUALIB_API int luaopen_jit(lua_State *L);
+ LUALIB_API int luaopen_ffi(lua_State *L);
+ LUALIB_API int luaopen_string_buffer(lua_State *L);
++LUALIB_API int luaopen_ccjson(lua_State *L);
++LUALIB_API int luaopen_ccmsgpack(lua_State *L);
+ 
+ LUALIB_API void luaL_openlibs(lua_State *L);
+ 
+diff --git a/src/msvcbuild.bat b/src/msvcbuild.bat
+index e0df88bc..6d86125b 100644
+--- a/src/msvcbuild.bat
++++ b/src/msvcbuild.bat
+@@ -110,14 +110,14 @@ buildvm -m folddef -o lj_folddef.h lj_opt_fold.c
+ @set LJLINK=%LJLINK% %LJLINKTYPE% %LJLINKTARGET%
+ @if "%1"=="amalg" goto :AMALGDLL
+ @if "%1"=="static" goto :STATIC
+-%LJCOMPILE% %LJDYNBUILD% lj_*.c lib_*.c
++%LJCOMPILE% %LJDYNBUILD% lj_*.c lib_*.c ..\ext\yyjson.c ..\ext\lib_ccjson.c ..\ext\lib_ccmsgpack.c
+ @if errorlevel 1 goto :BAD
+ @if "%1"=="mixed" goto :STATICLIB
+ %LJLINK% /DLL /OUT:%LJDLLNAME% lj_*.obj lib_*.obj
+ @if errorlevel 1 goto :BAD
+ @goto :MTDLL
+ :STATIC
+-%LJCOMPILE% lj_*.c lib_*.c
++%LJCOMPILE% lj_*.c lib_*.c ..\ext\yyjson.c ..\ext\lib_ccjson.c ..\ext\lib_ccmsgpack.c
+ @if errorlevel 1 goto :BAD
+ :STATICLIB
+ %LJLIB% /OUT:%LJLIBNAME% lj_*.obj lib_*.obj

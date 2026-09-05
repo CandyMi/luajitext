@@ -1,38 +1,43 @@
-# ext/ — ccjson & ccmsgpack 模块区(独立于 LuaJIT 核心)
+# LuaJIT - clib extension in built-in core.
 
-本目录是 cc 序列化模块的自洽载体:源码、测试、集成基准与核心 plumbing 补丁全部收在这里,
-**不进入 LuaJIT 的 src/**,也不设独立的 patches/ 目录。核心仓库保持原封,通过单一补丁注入接线。
+  本项目的代码 **不进入 LuaJIT 的 src/**, 独立于`LuaJIT`语言仅通过单一补丁注入集成.
 
-```
+```bash
 ext/
-  cc-codecs-core-plumbing.patch   单一 plumbing 补丁(仅改 LuaJIT 核心/构建文件)
-  README.md                       本文档
-  lib_ccjson.c                    ccjson 模块(JSON,引擎 yyjson)
-  lib_ccmsgpack.c                  ccmsgpack 模块(MessagePack,自研)
-  yyjson.c  yyjson.h              vendored yyjson(与 lib_ccjson.c 同目录,供引号包含)
+  cc-codecs-core-plumbing.patch  # 单一 plumbing 补丁(仅改 LuaJIT 核心/构建文件)
+  README.md                      # 本文档
+  lib_ccjson.c                   # ccjson 模块(JSON,引擎 yyjson)
+  lib_ccmsgpack.c                # ccmsgpack 模块(MessagePack,自研)
+  yyjson.c  yyjson.h             # vendored yyjson(与 lib_ccjson.c 同目录,供引号包含)
   tests/
-    test_json.lua                  ccjson 回归(独立可跑)
-    test_msgpack.lua               ccmsgpack 回归(对 ccjson 的共享断言为条件跳过,可独立跑)
-    bench.lua                      双模块 + string.buffer 集成基准(需两模块都已注入)
+    test_json.lua                # ccjson 回归(独立可跑)
+    test_msgpack.lua             # ccmsgpack 回归(对 ccjson 的共享断言为条件跳过,可独立跑)
+    bench.lua                    # 双模块 + string.buffer 集成基准(需两模块都已注入)
 ```
-
-未来若把 cc-json / cc-msgpack 各自独立成 git 源,本目录结构可直接拆分为两个子模块挂载点
-(`git submodule add <repo> ext/...`),补丁与 README 留在 ext 根随主仓管理。
 
 ## 快速开始
 
-```sh
+```bash
+# 1. 使用git源码或zip解压
+git clone https://github.com/LuaJIT/LuaJIT LuaJIT
+
+# 2. 进入目录并将本项目克隆到`ext`文件夹下(或者改成你喜欢的命名, 下面一起改)
+cd LuaJIT && git clone https://github.com/CandyMi/luajitext ext
+```
+
+```bash
 # 1. 注入核心接线(5 个文件:Makefile/lib_init.c/lualib.h/msvcbuild.bat/ljamalg.c)
 git apply ext/cc-codecs-core-plumbing.patch
 
-# 2. GNU 构建 + 测试
-make
-src/luajit ext/tests/test_json.lua      # ccjson
-src/luajit ext/tests/test_msgpack.lua   # ccmsgpack
-src/luajit ext/tests/bench.lua          # 集成基准
+# 2. 构建 + 测试
+make                                    # Linux/MacOS/BSD/Posix 用这个命令编译
+cd src && msvcbuild.bat                 # Windows 用 msvc 编译
+src/luajit ext/tests/test_json.lua      # 验证 ccjson
+src/luajit ext/tests/test_msgpack.lua   # 验证 ccmsgpack
+src/luajit ext/tests/bench.lua          # 集成基准 与 压测
 
-# 3. 还原(可选)
-git apply -R ext/cc-codecs-core-plumbing.patch && make
+# 还原代码(调试可选)
+git apply -R ext/cc-codecs-core-plumbing.patch && make clean && make
 ```
 
 MSVC:`msvcbuild.bat`(补丁已在编译行显式列出 `..\ext\` 三个源文件,`lib_*.c` 通配只扫 src)。

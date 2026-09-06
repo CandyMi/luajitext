@@ -25,6 +25,31 @@ local function hex(s)
   return table.concat(t, " ")
 end
 
+local function ok(...)  -- no error raised (encode / decode success paths)
+  local results = { pcall(...) }
+  if not results[1] then
+    error("FAIL (expected success): " .. tostring(results[2]), 2)
+  end
+  return select(2, unpack(results))
+end
+
+local function fails(...)  -- an error must be RAISED (programming errors)
+  local results = { pcall(...) }
+  if results[1] then
+    error("FAIL (expected raise): " .. tostring(results[2]), 2)
+  end
+  return results[2]
+end
+
+local function decerr(f, ...)  -- decode DATA errors return (nil, errmsg)
+  local v, e = f(...)
+  if v ~= nil or type(e) ~= "string" then
+    error("FAIL (expected decode error, got " .. tostring(v) .. " / "
+	  .. tostring(e) .. ")", 2)
+  end
+  return e
+end
+
 -- ---- Encoded byte-exactness (golden vectors) ----
 check(hex(mp.encode(0)) == "00", "uint 0")
 check(hex(mp.encode(127)) == "7f", "uint 127")
@@ -54,38 +79,44 @@ check(hex(mp.encode({ 1, 2, 3 })) == "93 01 02 03", "array 3")
 check(hex(mp.encode({ a = 1 })) == "81 a1 61 01", "map 1")
 check(hex(mp.encode("abc")) == "a3 61 62 63", "string -> str marker")
 
--- ---- decode of golden values (raw markers, decimal escapes) ----
-check(mp.decode("\0") == 0, "dec 0")
-check(mp.decode("\127") == 127, "dec 127")
-check(mp.decode("\255") == -1, "dec -1")
-check(mp.decode(mp.encode(2^31)) == 2^31, "dec 2^31")
-check(mp.decode(mp.encode(true)) == true, "dec true")
-check(mp.decode("\192") == null and mp.decode("\192") ~= nil, "dec nil -> null")
-check(mp.decode(mp.encode("héllo")) == "héllo", "dec str round trip")
-check(mp.decode(mp.encode(2.5)) == 2.5, "dec f64 round trip")
-local f32 = mp.decode("\202\064\073\015\219")
+-- ---- decode of golden values (raw markers, wrapped in a fixarray) ----
+-- Root contract: the input must be exactly one map/array container, so
+-- scalar roots are rejected (same as ccjson.decode). Wrap scalars in a
+-- fixarray (\145 = fixarray 1) to exercise value decoding.
+check(mp.decode("\145\0")[1] == 0, "dec 0")
+check(mp.decode("\145\127")[1] == 127, "dec 127")
+check(mp.decode("\145\255")[1] == -1, "dec -1")
+check(mp.decode(mp.encode({ 2^31 }))[1] == 2^31, "dec 2^31")
+check(mp.decode(mp.encode({ true }))[1] == true, "dec true")
+check(mp.decode("\145\192")[1] == null and mp.decode("\145\192")[1] ~= nil,
+      "dec nil -> null sentinel")
+check(mp.decode(mp.encode({ "héllo" }))[1] == "héllo", "dec str round trip")
+check(mp.decode(mp.encode({ 2.5 }))[1] == 2.5, "dec f64 round trip")
+local f32 = mp.decode("\145\202\064\073\015\219")[1]
 check(math.abs(f32 - 3.14) < 1e-2, "dec float32 3.14")
-check(mp.decode("\161x") == "x", "dec fixstr")
-check(mp.decode("\162ab") == "ab", "dec fixstr 2")
+check(mp.decode("\145\161x")[1] == "x", "dec fixstr")
+check(mp.decode("\145\162ab")[1] == "ab", "dec fixstr 2")
 
--- scalar roots are allowed (unlike ccjson)
-check(mp.decode("\42") == 42, "scalar root int")
-check(mp.decode("\162ab") == "ab", "scalar root string")
-check(mp.decode("\192") == null, "nil root -> null")
+-- bare scalar roots are rejected (decode error, returned as (nil, errmsg))
+check(decerr(mp.decode, "\0"):match("root"), "int root rejected")
+check(decerr(mp.decode, "\192"):match("root"), "nil root rejected")
+check(decerr(mp.decode, "\162ab"):match("root"), "string root rejected")
+check(decerr(mp.decode, mp.encode(true)):match("root"), "bool root rejected")
+check(decerr(mp.decode, mp.encode(2.5)):match("root"), "float root rejected")
 
 -- ---- numbers & cdata ----
-check(mp.decode(mp.encode(9007199254740992)) == 9007199254740992, "2^53")
+check(mp.decode(mp.encode({ 9007199254740992 }))[1] == 9007199254740992, "2^53")
 if ffi_ok then
   local big53 = ffi.new("int64_t", 2)^53
   local big = big53 + 1  -- 9007199254740993, exact
-  local v = mp.decode(mp.encode(big))
+  local v = mp.decode(mp.encode({ big }))[1]
   check(ffi.istype("int64_t", v) and v == big, "int64 cdata round trip")
   local umax = ffi.new("uint64_t", 0) - 1
-  local u = mp.decode(mp.encode(umax))
+  local u = mp.decode(mp.encode({ umax }))[1]
   check(ffi.istype("uint64_t", u) and u == umax, "uint64 max round trip")
   check(ffi.istype("int64_t",
-		   mp.decode("\211\016\0\0\0\0\0\0\0")), "dec raw int64 2^60")
-  check(mp.decode("\207\255\255\255\255\255\255\255\255") == umax,
+		   mp.decode("\145\211\016\0\0\0\0\0\0\0")[1]), "dec raw int64 2^60")
+  check(mp.decode("\145\207\255\255\255\255\255\255\255\255")[1] == umax,
 	"dec raw uint64")
   check(hex(mp.encode(umax)) == "cf ff ff ff ff ff ff ff ff", "uint64 golden")
 else
@@ -115,57 +146,55 @@ local withnil = mp.decode("\147\1\192\3")
 check(withnil[1] == 1 and withnil[2] == null and withnil[3] == 3,
       "array nil sentinel")
 check(hex(mp.encode(withnil)) == "93 01 c0 03", "sentinel array round trips")
--- bin decodes as string
-check(mp.decode("\196\3abc") == "abc", "bin8 -> string")
+-- bin decodes as string (inside a container; bin roots are rejected)
+check(mp.decode("\145\196\3abc")[1] == "abc", "bin8 -> string")
 
--- ---- unsupported / errors ----
-local r = { pcall(mp.decode, "\199\0\0") }
-check(not r[1] and r[2]:match("extension"), "ext8 rejected")
-r = { pcall(mp.decode, "\146\1") }
-check(not r[1] and r[2]:match("truncated"), "truncated input error")
-r = { pcall(mp.decode, "\1\2") }
-check(not r[1] and r[2]:match("trailing"), "trailing data error")
-r = { pcall(mp.decode, "\220\255\255") }
-check(not r[1] and r[2]:match("truncated"), "declared huge array rejected")
-r = { pcall(mp.decode, "") }
-check(not r[1] and r[2]:match("truncated"), "empty input error")
-r = { pcall(mp.decode, 42) }
-check(not r[1] and r[2]:match("string"), "non-string arg rejected")
-r = { pcall(mp.decode, "\147\1\2\3", { depth = 0 }) }
-check(not r[1] and r[2]:match("depth"), "depth 0 rejected")
-check(mp.decode("\145\1", { depth = 2 })[1] == 1, "depth opts ok")
-r = { pcall(mp.encode, { [true] = 3 }) }
-check(not r[1] and r[2]:match("key"), "bool map key rejected")
-r = { pcall(mp.encode, { a = 1, [true] = 3 }) }
-check(not r[1] and r[2]:match("key"), "bool map key rejected in map")
-r = { pcall(mp.encode, print) }
-check(not r[1] and r[2]:match("unsupported"), "function rejected")
-r = { pcall(mp.encode, { f = print }) }
-check(not r[1] and r[2]:match("unsupported"), "function member rejected")
-r = { pcall(mp.encode, 1, "x") }
-check(not r[1] and r[2]:match("table"), "opts must be table")
+-- ---- decode data errors: returned as (nil, errmsg) ----
+check(decerr(mp.decode, "\145\199\0\0"):match("extension"), "ext8 rejected")
+check(decerr(mp.decode, "\146\1"):match("truncated"), "truncated input error")
+check(decerr(mp.decode, "\145\1\2"):match("trailing"), "trailing data error")
+check(decerr(mp.decode, "\220\255\255"):match("truncated"),
+      "declared huge array rejected")
+check(decerr(mp.decode, ""):match("truncated"), "empty input error")
+
+-- ---- decode programming errors: still raise ----
+local r
+r = fails(mp.decode, 42)
+check(r:match("string"), "non-string arg rejected")
+r = fails(mp.decode, "\147\1\2\3", { depth = 0 })
+check(r:match("depth"), "depth 0 rejected")
+r = fails(mp.encode, { [true] = 3 })
+check(r:match("key"), "bool map key rejected")
+r = fails(mp.encode, { a = 1, [true] = 3 })
+check(r:match("key"), "bool map key rejected in map")
+r = fails(mp.encode, print)
+check(r:match("unsupported"), "function rejected")
+r = fails(mp.encode, { f = print })
+check(r:match("unsupported"), "function member rejected")
+r = fails(mp.encode, 1, "x")
+check(r:match("table"), "opts must be table")
 
 -- ---- depth (msgpack containers have no end markers: a1(a1(a1(1)))) ----
 local nested = "\145\145\145\1"
 check(mp.decode(nested, { depth = 3 }) ~= nil, "depth 3 ok")
-r = { pcall(mp.decode, nested, { depth = 2 }) }
-check(not r[1] and r[2]:match("depth"), "depth exceeded during parse")
+check(decerr(mp.decode, nested, { depth = 2 }):match("depth"),
+      "depth exceeded during parse")
 local deep = {}
 local cur = deep
 for i = 1, 20 do cur[1] = {}; cur = cur[1] end
 check(mp.decode(mp.encode(deep, { depth = 32 }), { depth = 32 }) ~= nil,
       "opts depth 32")
-r = { pcall(mp.encode, deep) }
-check(not r[1] and r[2]:match("depth"), "default depth exceeded encode")
+r = fails(mp.encode, deep)
+check(r:match("depth"), "default depth exceeded encode")
 local cyc = {}
 cyc.self = cyc
-r = { pcall(mp.encode, cyc) }
-check(not r[1] and r[2]:match("depth"), "cycle caught by depth")
+r = fails(mp.encode, cyc)
+check(r:match("depth"), "cycle caught by depth")
 
 -- ---- NaN / Inf (msgpack supports them) ----
-local nan = mp.decode(mp.encode(0 / 0))
+local nan = mp.decode(mp.encode({ 0 / 0 }))[1]
 check(nan ~= nan, "NaN round trip")
-local inf = mp.decode(mp.encode(1 / 0))
+local inf = mp.decode(mp.encode({ 1 / 0 }))[1]
 check(inf == math.huge, "Inf round trip")
 
 -- ---- cross-module: ccjson arrays share the marker ----

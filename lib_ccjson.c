@@ -16,13 +16,16 @@
 **         nan_literal (bool; write NaN/Inf as JSON5 NaN/Infinity),
 **         nan_null (bool; write NaN/Inf as null, takes precedence over
 **         nan_literal). Without the nan_* options NaN/Inf are an error.
-**   * decode(str[, opts]) -> table
+**   * decode(str[, opts]) -> table | nil, string?
 **       - root MUST be a JSON object or array (scalar roots rejected)
 **       - opts: depth (int, default 16; limits doc->Lua conversion
 **         recursion), utf8 (bool), json5 (bool; JSON5 reader: comments,
 **         trailing commas, single quotes, unquoted keys, hex/extension
 **         numbers, NaN/Infinity), nan (bool; bare NaN/Infinity allowance;
 **         json5 is a superset). Default is strict RFC 8259.
+**       - ERROR CONTRACT: data errors (syntax errors, scalar root, depth
+**         overflow during conversion) are RETURNED as (nil, errmsg);
+**         programming errors (bad arguments, invalid opts) raise.
 **         pretty is ignored on decode
 **   * Type mapping Lua -> JSON
 **       int32      -> number            double -> number
@@ -72,6 +75,18 @@
 #include "lauxlib.h"
 #include "lualib.h"
 
+#include <setjmp.h>
+/* Standard setjmp() saves the signal mask on POSIX platforms (Apple's
+** implementation costs ~800 ns per call), and decode() invokes it once per
+** call. Use the no-signal-mask variants where the platform provides them;
+** MSVC setjmp never touches the mask, so plain setjmp is fine there. */
+#if defined(_WIN32)
+#define CCJMP_RET(env)		  setjmp(env)
+#define CCJMP_THROW(env, v)	longjmp(env, v)
+#else
+#define CCJMP_RET(env)		  _setjmp(env)
+#define CCJMP_THROW(env, v)	_longjmp(env, v)
+#endif
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -466,15 +481,43 @@ static int ccjson_encode(lua_State *L)
 
 /* -- Decoder ------------------------------------------------------------- */
 
+/* Decode error channel: data errors never raise. ccjson_decode_fail
+** formats the message into dx->err and longjmps back to the setjmp in
+** ccjson_decode_body, which frees the partial yyjson doc, rewinds the Lua
+** stack to savetop and returns (nil, errmsg). Programming errors (bad
+** arguments, invalid options) still raise via ccjson_error. Never returns. */
+typedef struct {
+  jmp_buf jmp;         /* setjmp target in ccjson_decode_body. */
+  yyjson_doc *doc;     /* owned doc: freed on the decode-error path. */
+  char err[256];       /* formatted error message. */
+} CCDecodeCtx;
+
+static void LJ_NORET ccjson_decode_fail(lua_State *L, CCDecodeCtx *dx,
+					const char *fmt, ...)
+{
+  va_list ap;
+  size_t len;
+  va_start(ap, fmt);
+  lua_pushvfstring(L, fmt, ap);
+  va_end(ap);
+  len = (size_t)strV(L->top - 1)->len;
+  if (len >= sizeof(dx->err)) len = sizeof(dx->err) - 1;
+  memcpy(dx->err, strdata(strV(L->top - 1)), len);
+  dx->err[len] = '\0';
+  L->top--;
+  CCJMP_THROW(dx->jmp, 1);
+}
+
 /* Convert a yyjson value and push the Lua result on the stack.
 ** Containers are kept anchored on the stack while being filled, so nested
 ** allocation can never collect a table under construction.
 ** `depth` is the number of container levels still allowed.
 ** The integer policy below is shared with ccmsgpack (lib_ccmsgpack.c);
-** keep the two modules in sync.
+** keep the two modules in sync. Conversion errors (depth overflow, ...)
+** go through the decode error channel via dx.
 */
 static void ccjson_get_value(lua_State *L, yyjson_val *v, GCtab *amt,
-			     int depth)
+			     int depth, CCDecodeCtx *dx)
 {
   yyjson_type type = yyjson_get_type(v);
   if (type == YYJSON_TYPE_NULL) {
@@ -546,9 +589,9 @@ static void ccjson_get_value(lua_State *L, yyjson_val *v, GCtab *amt,
     GCtab *t;
     size_t i, max = yyjson_get_len(v);
     if (depth <= 0)
-      ccjson_error(L, "ccjson.decode: container nesting exceeds depth limit");
+      ccjson_decode_fail(L, dx, "ccjson.decode: container nesting exceeds depth limit");
     if (max > (size_t)2147483647L)
-      ccjson_error(L, "ccjson.decode: array too long");
+      ccjson_decode_fail(L, dx, "ccjson.decode: array too long");
     /* Pre-size the Lua table from the JSON container length: JSON arrays
     ** are dense, so pass the full array-part size (slot 0 is unused, hence
     ** max+1); JSON objects get enough hash slots to avoid rehashing while
@@ -572,7 +615,7 @@ static void ccjson_get_value(lua_State *L, yyjson_val *v, GCtab *amt,
       for (i = 0; i < max; i++) {
 	yyjson_val *el = yyjson_arr_get(v, i);
 	TValue *slot;
-	ccjson_get_value(L, el, amt, depth - 1);
+	ccjson_get_value(L, el, amt, depth - 1, dx);
 	slot = lj_tab_setint(L, t, (int32_t)(i + 1));
 	copyTV(L, slot, L->top - 1);
 	L->top--;
@@ -583,7 +626,7 @@ static void ccjson_get_value(lua_State *L, yyjson_val *v, GCtab *amt,
       yyjson_obj_foreach(v, idx, max, key, val) {
 	GCstr *ks = lj_str_new(L, yyjson_get_str(key), yyjson_get_len(key));
 	TValue *slot;
-	ccjson_get_value(L, val, amt, depth - 1);
+	ccjson_get_value(L, val, amt, depth - 1, dx);
 	slot = lj_tab_setstr(L, t, ks);
 	copyTV(L, slot, L->top - 1);
 	L->top--;
@@ -591,9 +634,34 @@ static void ccjson_get_value(lua_State *L, yyjson_val *v, GCtab *amt,
     }
     /* Container stays on the stack (anchored); leave it as the result. */
   } else {
-    ccjson_error(L, "ccjson.decode: unsupported JSON value type %u",
+    ccjson_decode_fail(L, dx, "ccjson.decode: unsupported JSON value type %u",
 		 (unsigned)type);
   }
+}
+
+static int ccjson_decode_body(lua_State *L, CCDecodeCtx *dx, yyjson_doc *doc,
+			      yyjson_val *root, int depth, GCtab *amt,
+			      int savetop)
+{
+  if (CCJMP_RET(dx->jmp)) {
+    /* A conversion error occurred: ccjson_decode_fail formatted dx->err
+    ** and longjmp'd back here. Free the doc, drop the partially-built
+    ** Lua tree (containers anchored above savetop) and return (nil, errmsg).
+    ** dx lives in ccjson_decode's frame, so its fields are stable across
+    ** the longjmp. */
+    if (dx->doc) {
+      yyjson_doc_free(dx->doc);
+      dx->doc = NULL;
+    }
+    L->top = L->base + savetop;
+    lua_pushnil(L);
+    lua_pushstring(L, dx->err);
+    return 2;
+  }
+  ccjson_get_value(L, root, amt, depth, dx);
+  yyjson_doc_free(doc);
+  dx->doc = NULL;
+  return 1;
 }
 
 static int ccjson_decode(lua_State *L)
@@ -601,12 +669,14 @@ static int ccjson_decode(lua_State *L)
   GCstr *str;
   GCtab *amt;
   GCtab *opts = NULL;
+  CCDecodeCtx dx;
   yyjson_doc *doc;
   yyjson_val *root;
   yyjson_read_err rerr;
   yyjson_read_flag rflg = YYJSON_READ_NOFLAG;
   int depth = CCJSON_DEFAULT_DEPTH;
   int utf8, json5, nan;
+  int savetop;
   if (!(L->base < L->top && tvisstr(L->base)))
     ccjson_argtype(L, 1, (L->base < L->top) ? L->base : NULL, "decode",
 		   "string");
@@ -627,23 +697,26 @@ static int ccjson_decode(lua_State *L)
   if (json5 == 1) rflg |= YYJSON_READ_JSON5;
   amt = ccjson_array_mt(L);
   lj_state_checkstack(L, depth * 4 + 64);
+  savetop = (int)(L->top - L->base);  /* After checkstack: base may move. */
   memset(&rerr, 0, sizeof(rerr));
   doc = yyjson_read_opts((char *)strdata(str), str->len, rflg, NULL, &rerr);
   if (!doc) {
-    ccjson_error(L, "ccjson.decode: %s (at byte %u)",
-		 rerr.msg ? rerr.msg : "parse error", (unsigned)rerr.pos);
-    return 0;
+    lua_pushnil(L);
+    lua_pushfstring(L, "ccjson.decode: %s (at byte %u)",
+		    rerr.msg ? rerr.msg : "parse error", (unsigned)rerr.pos);
+    return 2;
   }
   root = yyjson_doc_get_root(doc);
   if (!root || (yyjson_get_type(root) != YYJSON_TYPE_ARR &&
 		yyjson_get_type(root) != YYJSON_TYPE_OBJ)) {
     yyjson_doc_free(doc);
-    ccjson_error(L, "ccjson.decode: root value must be an object or an array");
-    return 0;
+    lua_pushnil(L);
+    lua_pushliteral(L,
+		    "ccjson.decode: root value must be an object or an array");
+    return 2;
   }
-  ccjson_get_value(L, root, amt, depth);
-  yyjson_doc_free(doc);
-  return 1;
+  dx.doc = doc;  /* Decode body frees it on the decode-error path. */
+  return ccjson_decode_body(L, &dx, doc, root, depth, amt, savetop);
 }
 
 /* -- Module open --------------------------------------------------------- */

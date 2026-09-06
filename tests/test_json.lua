@@ -35,6 +35,15 @@ local function fails(...)  -- an error must be raised
   return results[2]
 end
 
+local function decerr(f, ...)  -- decode DATA errors return (nil, errmsg)
+  local v, e = f(...)
+  if v ~= nil or type(e) ~= "string" then
+    error("FAIL (expected decode error, got " .. tostring(v) .. " / "
+	  .. tostring(e) .. ")", 2)
+  end
+  return e
+end
+
 -- ---- Scalars (encode) ----
 check(ccjson.encode("abc") == '"abc"', "string")
 check(ccjson.encode("") == '""', "empty string")
@@ -46,9 +55,9 @@ check(ccjson.encode(null) == "null", "null constant")
 check(fails(ccjson.encode, nil):match("nil"), "nil root rejected")
 
 -- ---- Scalars (decode root restriction) ----
-check(fails(ccjson.decode, "1"):match("root"), "scalar root rejected")
-check(fails(ccjson.decode, "null"):match("root"), "null root rejected")
-check(fails(ccjson.decode, '"x"'):match("root"), "string root rejected")
+check(decerr(ccjson.decode, "1"):match("root"), "scalar root rejected")
+check(decerr(ccjson.decode, "null"):match("root"), "null root rejected")
+check(decerr(ccjson.decode, '"x"'):match("root"), "string root rejected")
 
 -- ---- Numbers ----
 check(ccjson.decode("[1]")[1] == 1, "int")
@@ -161,7 +170,7 @@ check(fails(ccjson.encode, coroutine.create(function() end)):match("unsupported"
 
 -- ---- Depth ----
 check(ccjson.decode("[1]", { depth = 1 })[1] == 1, "depth opts 1 ok")
-check(fails(ccjson.decode, "[[1]]", { depth = 1 }):match("depth"),
+check(decerr(ccjson.decode, "[[1]]", { depth = 1 }):match("depth"),
       "depth exceeded decode")
 local deep = {}
 local cur = deep
@@ -189,15 +198,16 @@ check(fails(ccjson.encode, bad):match("encode"), "invalid utf8 rejected")
 local rt = ccjson.encode(bad, { utf8 = true })
 local back = ccjson.decode("[" .. rt .. "]", { utf8 = true })[1]
 check(back == bad, "utf8=true byte round trip")
-local strict_ok = pcall(ccjson.decode, '["\255"]')
-check(not strict_ok, "invalid utf8 input rejected by default")
+-- invalid utf8 input is now a returned decode error (not a raise)
+check(decerr(ccjson.decode, '["\255"]'):match("decode"),
+      "invalid utf8 input is a decode error")
 
 -- ---- Syntax / error paths ----
-check(fails(ccjson.decode, ""):match("decode"), "empty input")
-check(fails(ccjson.decode, "[1] x"):match("decode"), "trailing content")
-check(fails(ccjson.decode, "[1,"):match("decode"), "truncated input")
-check(fails(ccjson.decode, "{a:1}"):match("decode"), "bare key rejected")
-local err = fails(ccjson.decode, "[] garbage")
+check(decerr(ccjson.decode, ""):match("decode"), "empty input")
+check(decerr(ccjson.decode, "[1] x"):match("decode"), "trailing content")
+check(decerr(ccjson.decode, "[1,"):match("decode"), "truncated input")
+check(decerr(ccjson.decode, "{a:1}"):match("decode"), "bare key rejected")
+local err = decerr(ccjson.decode, "[] garbage")
 check(err:match("at byte"), "error reports byte position")
 check(ccjson.decode("  [1]  ")[1] == 1, "whitespace tolerated")
 check(fails(ccjson.decode, 42):match("string"), "non-string arg rejected")
@@ -205,7 +215,7 @@ check(fails(ccjson.encode, 1, "x"):match("table"), "opts must be table")
 
 -- ---- JSON5 / NaN ----
 -- strict default: NaN/Infinity are NOT valid JSON
-check(fails(ccjson.decode, "[NaN]"):match("decode"), "NaN rejected by default")
+check(decerr(ccjson.decode, "[NaN]"):match("decode"), "NaN rejected by default")
 check(fails(ccjson.encode, 0 / 0):match("nan"), "encode NaN errors by default")
 check(fails(ccjson.encode, math.huge):match("nan"), "encode Inf errors by default")
 -- decode opts.nan: bare Infinity/NaN allowance, rest stays strict
@@ -213,7 +223,7 @@ check(ccjson.decode("[Infinity]", { nan = true })[1] == math.huge, "nan +Inf")
 check(ccjson.decode("[-Infinity]", { nan = true })[1] == -math.huge, "nan -Inf")
 local nv = ccjson.decode("[NaN]", { nan = true })[1]
 check(nv ~= nv, "nan NaN")
-check(fails(ccjson.decode, "{a:1}", { nan = true }), "nan does not allow json5")
+decerr(ccjson.decode, "{a:1}", { nan = true })  -- nan does not allow json5
 -- decode opts.json5: comments/trailing/single-quote/unquoted/hex/NaN
 local j5a = ccjson.decode("[1/*x*/, 2,]", { json5 = true })
 check(j5a[1] == 1 and j5a[2] == 2, "json5 comments + trailing comma")

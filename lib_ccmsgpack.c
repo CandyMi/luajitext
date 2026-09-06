@@ -11,12 +11,17 @@
 **   * encode(value[, opts]) -> string
 **       - opts: depth (int, default 16); other fields ignored.
 **       - root may be ANY value, including nil (encoded as msgpack nil).
-**   * decode(str[, opts]) -> value
-**       - root may be any msgpack value (nil decodes to ccmsgpack.null).
+**   * decode(str[, opts]) -> table | nil, string?
+**       - root MUST be a map or an array (scalar/nil roots are rejected;
+**         same root contract as ccjson.decode).
 **       - opts: depth (int, default 16, range 1..1024), enforced DURING
 **         parsing; other fields ignored.
 **       - the whole input must be exactly one msgpack value (trailing or
-**         truncated input is an error, reported with a byte offset).
+**         truncated input is a decode error, reported with a byte offset).
+**       - ERROR CONTRACT: data errors (malformed/truncated/trailing input,
+**         unsupported marker, depth overflow, scalar root) are RETURNED as
+**         (nil, errmsg); programming errors (bad arguments, invalid opts)
+**         raise like encode.
 **   * Lua -> msgpack
 **       nil (as member)      -> key skipped / ends the array prefix
 **       NULL lightuserdata (ccmsgpack.null / ccjson.null) -> nil (0xc0)
@@ -64,6 +69,18 @@
 #include "lauxlib.h"
 #include "lualib.h"
 
+#include <setjmp.h>
+/* Standard setjmp() saves the signal mask on POSIX platforms (Apple's
+** implementation costs ~800 ns per call), and decode() invokes it once per
+** call. Use the no-signal-mask variants where the platform provides them;
+** MSVC setjmp never touches the mask, so plain setjmp is fine there. */
+#if defined(_WIN32)
+#define CCJMP_RET(env)		setjmp(env)
+#define CCJMP_THROW(env, v)	longjmp(env, v)
+#else
+#define CCJMP_RET(env)		_setjmp(env)
+#define CCJMP_THROW(env, v)	_longjmp(env, v)
+#endif
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -597,17 +614,50 @@ static int mp_encode(lua_State *L)
 /* -- Decoder ------------------------------------------------------------- */
 
 /* Parse cursor. `p` advances, `s`/`w` bound the input (never read past w,
-** offsets in error messages are relative to s). */
+** offsets in error messages are relative to s). The decode-only fields
+** (jmp/err) implement the decode error contract: data errors are never
+** raised -- the sink formats the message into err[] and longjmps back to
+** the setjmp in mp_decode_body, which returns (nil, errmsg). */
 typedef struct {
   const char *p;
   const char *w;
   const char *s;
+  jmp_buf jmp;     /* decode only: setjmp target in mp_decode_body. */
+  char err[256];   /* decode only: formatted error message. */
 } MPCursor;
+
+/* Decode-scope error: format the message into c->err and longjmp back to
+** mp_decode_body, which drops the partial tree and returns (nil, errmsg)
+** to the caller. Only DATA errors go through this channel; programming
+** errors (bad arguments/options) still raise via mp_error. Never returns. */
+static void LJ_NORET mp_decode_fail(lua_State *L, MPCursor *c,
+				    const char *fmt, ...)
+{
+  va_list ap;
+  size_t len;
+  va_start(ap, fmt);
+  lua_pushvfstring(L, fmt, ap);
+  va_end(ap);
+  len = (size_t)strV(L->top - 1)->len;
+  if (len >= sizeof(c->err)) len = sizeof(c->err) - 1;
+  memcpy(c->err, strdata(strV(L->top - 1)), len);
+  c->err[len] = '\0';
+  L->top--;
+  CCJMP_THROW(c->jmp, 1);
+}
 
 static void mp_trunc(lua_State *L, MPCursor *c)
 {
-  mp_error(L, "ccmsgpack.decode: truncated input at byte %d",
-	   (int)(c->p - c->s));
+  mp_decode_fail(L, c, "ccmsgpack.decode: truncated input at byte %d",
+		 (int)(c->p - c->s));
+}
+
+/* True if the marker byte starts a map/array container (msgpack values
+** carry no end markers: the header byte fully classifies a value). */
+static LJ_AINLINE int mp_container_marker(uint8_t b)
+{
+  return (b >= 0x80 && b <= 0x8f) || (b >= 0x90 && b <= 0x9f) ||
+	 b == MP_MAP16 || b == MP_MAP32 || b == MP_ARRAY16 || b == MP_ARRAY32;
 }
 
 static LJ_AINLINE uint8_t mp_rd8(lua_State *L, MPCursor *c)
@@ -698,7 +748,8 @@ static void mp_fill_unsigned(lua_State *L, TValue *out, uint64_t u)
 }
 
 /* Read an integer map key of any msgpack width; the value must fit int32.
-** Returns 0 on success (value in *out), raises otherwise. */
+** Returns 0 on success (value in *out); otherwise the decode fails and the
+** error is returned as (nil, errmsg) by mp_decode. */
 static void mp_rd_int32(lua_State *L, MPCursor *c, uint8_t b, int32_t *out)
 {
   int64_t v;
@@ -714,8 +765,8 @@ static void mp_rd_int32(lua_State *L, MPCursor *c, uint8_t b, int32_t *out)
     case MP_UINT64: {
       uint64_t u = mp_rd64(L, c);
       if (u > (uint64_t)2147483647LL)
-	      mp_error(L, "ccmsgpack.decode: integer map key out of int32 range "
-		 "at byte %d", (int)(c->p - c->s) - 1);
+      mp_decode_fail(L, c, "ccmsgpack.decode: integer map key out of int32 range "
+                     "at byte %d", (int)(c->p - c->s) - 1);
       v = (int64_t)u;
       break;
     }
@@ -724,20 +775,21 @@ static void mp_rd_int32(lua_State *L, MPCursor *c, uint8_t b, int32_t *out)
     case MP_INT32: v = (int64_t)(int32_t)mp_rd32(L, c); break;
     case MP_INT64: v = (int64_t)mp_rd64(L, c); break;
     default:
-      mp_error(L, "ccmsgpack.decode: invalid marker 0x%02x at byte %d",
-	       b, (int)(c->p - c->s) - 1);
+      mp_decode_fail(L, c, "ccmsgpack.decode: invalid marker 0x%02x at byte %d",
+                     b, (int)(c->p - c->s) - 1);
       return;
     }
   }
   if (v < -2147483648LL || v > 2147483647LL)
-    mp_error(L, "ccmsgpack.decode: integer map key out of int32 range "
-	     "at byte %d", (int)(c->p - c->s) - 1);
+    mp_decode_fail(L, c, "ccmsgpack.decode: integer map key out of int32 range "
+                   "at byte %d", (int)(c->p - c->s) - 1);
   *out = (int32_t)v;
 }
 
 /* Decode a map key. Keys are strings (return 0, *kstr set) or int32-range
-** integers (return 1, *kint set); anything else raises. String keys are
-** interned, so they stay reachable while the value is decoded. */
+** integers (return 1, *kint set); anything else fails the decode (returned
+** as (nil, errmsg)). String keys are interned, so they stay reachable
+** while the value is decoded. */
 static int mp_rd_key(lua_State *L, MPCursor *c, GCstr **kstr, int32_t *kint)
 {
   uint8_t b = mp_rd8(L, c);
@@ -765,8 +817,8 @@ static int mp_rd_key(lua_State *L, MPCursor *c, GCstr **kstr, int32_t *kint)
     mp_rd_int32(L, c, b, kint);
     return 1;
   }
-  mp_error(L, "ccmsgpack.decode: unsupported map key type (marker 0x%02x) "
-	   "at byte %d", b, (int)(c->p - c->s) - 1);
+  mp_decode_fail(L, c, "ccmsgpack.decode: unsupported map key type (marker 0x%02x) "
+                 "at byte %d", b, (int)(c->p - c->s) - 1);
   return 0;
 }
 
@@ -779,16 +831,16 @@ static uint32_t mp_rd_count(lua_State *L, MPCursor *c, uint8_t b)
   if (b == MP_ARRAY16 || b == MP_MAP16) n = mp_rd16(L, c);
   else if (b == MP_ARRAY32 || b == MP_MAP32) n = mp_rd32(L, c);
   else {
-    mp_error(L, "ccmsgpack.decode: invalid container marker 0x%02x at byte %d",
-	     b, (int)(c->p - c->s) - 1);
+    mp_decode_fail(L, c, "ccmsgpack.decode: invalid container marker 0x%02x at byte %d",
+                   b, (int)(c->p - c->s) - 1);
     return 0;
   }
   /* Every element occupies at least one byte: reject impossible counts
   ** before allocating anything. */
   if ((uint64_t)n > (uint64_t)(c->w - c->p)) mp_trunc(L, c);
   if (n > (uint32_t)MP_MAX_COUNT)
-    mp_error(L, "ccmsgpack.decode: container too large at byte %d",
-	     (int)(c->p - c->s) - 1);
+    mp_decode_fail(L, c, "ccmsgpack.decode: container too large at byte %d",
+                   (int)(c->p - c->s) - 1);
   return n;
 }
 
@@ -819,8 +871,8 @@ static void mp_fill_value(lua_State *L, MPCursor *c, GCtab *amt, int depth,
       mp_fill_signed(L, out, (int64_t)(int32_t)mp_rd32(L, c)); break;
     case MP_INT64: mp_fill_signed(L, out, (int64_t)mp_rd64(L, c)); break;
     default:
-      mp_error(L, "ccmsgpack.decode: invalid marker 0x%02x at byte %d",
-	       b, (int)(c->p - c->s) - 1);
+      mp_decode_fail(L, c, "ccmsgpack.decode: invalid marker 0x%02x at byte %d",
+                     b, (int)(c->p - c->s) - 1);
     }
   } else if (b == MP_NIL) {
     mp_fill_null(L, out);  /* Same canonical value as .null. */
@@ -858,7 +910,7 @@ static void mp_fill_value(lua_State *L, MPCursor *c, GCtab *amt, int depth,
     MSize ahint;
     TValue *arr;
     if (depth <= 0)
-      mp_error(L, "ccmsgpack.decode: container nesting exceeds depth limit");
+      mp_decode_fail(L, c, "ccmsgpack.decode: container nesting exceeds depth limit");
     /* Pre-size the array part so every element can be decoded straight
     ** into its slot (slot i holds key i; slot 0 is unused). */
     ahint = (MSize)((uint64_t)n + 1 > ((uint64_t)1 << 20) ?
@@ -883,7 +935,7 @@ static void mp_fill_value(lua_State *L, MPCursor *c, GCtab *amt, int depth,
     uint32_t i;
     GCtab *t;
     if (depth <= 0)
-      mp_error(L, "ccmsgpack.decode: container nesting exceeds depth limit");
+      mp_decode_fail(L, c, "ccmsgpack.decode: container nesting exceeds depth limit");
     t = lj_tab_new(L, 0, 0);
     lj_gc_anybarriert(L, t);
     settabV(L, out, t);
@@ -898,19 +950,47 @@ static void mp_fill_value(lua_State *L, MPCursor *c, GCtab *amt, int depth,
       mp_fill_value(L, c, amt, depth - 1, slot);
     }
   } else if (b >= MP_FIXEXT1 && b <= MP_FIXEXT16) {
-    mp_error(L, "ccmsgpack.decode: unsupported extension value at byte %d",
-	     (int)(c->p - c->s) - 1);
+    mp_decode_fail(L, c, "ccmsgpack.decode: unsupported extension value at byte %d",
+                   (int)(c->p - c->s) - 1);
   } else if (b == MP_EXT8 || b == MP_EXT16 || b == MP_EXT32) {
-    mp_error(L, "ccmsgpack.decode: unsupported extension value at byte %d",
-	     (int)(c->p - c->s) - 1);
+    mp_decode_fail(L, c, "ccmsgpack.decode: unsupported extension value at byte %d",
+                   (int)(c->p - c->s) - 1);
   } else {
-    mp_error(L, "ccmsgpack.decode: invalid marker 0x%02x at byte %d",
-	     b, (int)(c->p - c->s) - 1);
+    mp_decode_fail(L, c, "ccmsgpack.decode: invalid marker 0x%02x at byte %d",
+                   b, (int)(c->p - c->s) - 1);
   }
 }
 
 /* -- Decoder entry ------------------------------------------------------- */
 
+static int mp_decode_body(lua_State *L, MPCursor *c, GCtab *amt, int depth,
+			  int savetop)
+{
+  TValue *out;
+  c->err[0] = '\0';
+  if (CCJMP_RET(c->jmp)) {
+    /* A data error occurred: mp_decode_fail formatted c->err and longjmp'd
+    ** back here. Drop the partial tree (everything reachable from the root
+    ** slot pushed above savetop) and return (nil, errmsg). c lives in
+    ** mp_decode's frame, so its fields are stable across the longjmp. */
+    L->top = L->base + savetop;
+    lua_pushnil(L);
+    lua_pushstring(L, c->err);
+    return 2;
+  }
+  out = L->top++;  /* Result slot; rooted on the Lua stack. */
+  mp_fill_value(L, c, amt, depth, out);
+  if (c->p != c->w)
+    mp_decode_fail(L, c, "ccmsgpack.decode: trailing data at byte %d",
+		   (int)(c->p - c->s));
+  return 1;
+}
+
+/* Decode one msgpack document. The input must be exactly one map/array
+** container (same root contract as ccjson.decode). DATA errors (malformed
+** input, scalar root, depth overflow, trailing bytes) are returned to the
+** caller as (nil, errmsg); programming errors (bad argument types, invalid
+** options) raise like encode. */
 static int mp_decode(lua_State *L)
 {
   GCstr *str;
@@ -918,6 +998,7 @@ static int mp_decode(lua_State *L)
   GCtab *opts = NULL;
   MPCursor c;
   int depth = MP_DEFAULT_DEPTH;
+  int savetop;
   if (!(L->base < L->top && tvisstr(L->base)))
     mp_argtype(L, 1, (L->base < L->top) ? L->base : NULL, "decode",
 	       "string");
@@ -934,14 +1015,20 @@ static int mp_decode(lua_State *L)
   c.s = strdata(str);
   c.p = c.s;
   c.w = c.s + str->len;
-  {
-    TValue *out = L->top++;  /* Result slot; rooted on the Lua stack. */
-    mp_fill_value(L, &c, amt, depth, out);
+  savetop = (int)(L->top - L->base);  /* After checkstack: base may move. */
+  if (c.p >= c.w) {
+    lua_pushnil(L);
+    lua_pushfstring(L, "ccmsgpack.decode: truncated input at byte %d",
+		    (int)(c.p - c.s));
+    return 2;
   }
-  if (c.p != c.w)
-    mp_error(L, "ccmsgpack.decode: trailing data at byte %d",
-	     (int)(c.p - c.s));
-  return 1;
+  if (!mp_container_marker((uint8_t)*c.p)) {
+    lua_pushnil(L);
+    lua_pushliteral(L,
+		    "ccmsgpack.decode: root value must be an object or an array");
+    return 2;
+  }
+  return mp_decode_body(L, &c, amt, depth, savetop);
 }
 
 /* -- Module open --------------------------------------------------------- */

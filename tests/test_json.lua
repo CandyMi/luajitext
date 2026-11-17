@@ -282,10 +282,23 @@ check(back2.nested.deep.deeper.deepest == "ok", "rt nested")
 check(next(back2.empty_obj) == nil and getmetatable(back2.empty_obj) == nil,
       "rt empty obj plain")
 check(getmetatable(back2.empty_arr) == Array, "rt empty arr marker")
--- Re-encoding a decoded object is byte-idempotent from the second
--- generation on (object key ORDER is not specified; the decoded table's
--- hash layout is deterministic for a given input).
+-- Object key ORDER is not a contract (hash-layout dependent; encode() walks
+-- members with lua_next); what must hold is that decode/re-encode is
+-- content-stable.
+local function deep_equal(a, b)
+  if a == b then return true end
+  if type(a) ~= "table" or type(b) ~= "table" then return false end
+  if getmetatable(a) ~= getmetatable(b) then return false end
+  for k, v in pairs(a) do
+    if b[k] == nil and v ~= nil then return false end
+    if not deep_equal(v, b[k]) then return false end
+  end
+  for k in pairs(b) do
+    if a[k] == nil then return false end
+  end
+  return true
+end
 local txt2 = ccjson.encode(back2)
-check(ccjson.encode(ccjson.decode(txt2)) == txt2, "rt idempotent")
+check(deep_equal(ccjson.decode(txt2), back2), "rt content-stable")
 
 print(string.format("ok: %d checks passed", nchecks))

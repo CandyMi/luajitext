@@ -40,7 +40,7 @@ src/luajit ext/tests/bench.lua          # 集成基准 与 压测
 git apply -R ext/cc-codecs-core-plumbing.patch && make clean && make
 ```
 
-MSVC:`msvcbuild.bat`(补丁已在编译行显式列出 `..\ext\` 三个源文件,`lib_*.c` 通配只扫 src)。
+MSVC:`msvcbuild.bat`(补丁已在编译行显式列出 `..\ext\` 三个源文件并带 `/I.`,`lib_*.c` 通配只扫 src)。
 amalg:`make amalg`(补丁已在 `src/ljamalg.c` 以 `../ext/...` 相对路径并入三份源码)。
 yyjson.c 为 C99;若 cl 默认 C 模式报语法错,给该编译行加 `/std:c11`(两个模块自身是 C89 纪律,无需)。
 
@@ -51,7 +51,7 @@ yyjson.c 为 C99;若 cl 默认 C 模式报语法错,给该编译行加 `/std:c11
 | `src/Makefile` | `LJCORE_O` 尾部 += `yyjson.o lib_ccjson.o lib_ccmsgpack.o`;对象规则区新增 ext 源 → src 对象的显式规则(`%.o: ../ext/%.c`,静态与 `_dyn.o` 双产物,`-I.` 解析 src 头) | 模块**不进** `LJLIB_O`/`LJLIB_C`:避免污染 buildvm 的扫描源列表(buildvm 只需 src 内 lib_*.c) |
 | `src/lib_init.c` | `lj_lib_preload[]` += ccjson / ccmsgpack | `require(...)` 预加载,不设全局 |
 | `src/lualib.h` | 声明两个 `luaopen_*` | 头文件可见性 |
-| `src/msvcbuild.bat` | 两条编译行显式追加 `..\ext\yyjson.c ..\ext\lib_ccjson.c ..\ext\lib_ccmsgpack.c` | MSVC 通配够不到 ext |
+| `src/msvcbuild.bat` | 两条编译行显式追加 `..\ext\yyjson.c ..\ext\lib_ccjson.c ..\ext\lib_ccmsgpack.c` 并加 `/I.` | MSVC 通配够不到 ext;`#include "lua.h"`/`"lj_*.h"` 由 cl 的 `/I.`(batch 在 `src/` 下执行)解析,不会搜源文件所在的 `..\ext\` |
 | `src/ljamalg.c` | include 尾追加三份 `../ext/...c` | amalg 单文件构建 |
 
 要点:

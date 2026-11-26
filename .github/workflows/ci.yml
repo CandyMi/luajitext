@@ -66,11 +66,15 @@ jobs:
       fail-fast: false
       matrix:
         shell: [cmd, pwsh]
+    # Step-level `shell:` allows no expression contexts, so the matrix value is
+    # applied here instead; steps below that need a specific shell set it.
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
     steps:
       # The patch carries CRLF lines for msvcbuild.bat, and every other hunk
       # expects LF sources: check out both repos byte-for-byte.
       - name: Keep original line endings
-        shell: ${{ matrix.shell }}
         run: git config --global core.autocrlf false
 
       - name: Checkout LuaJIT
@@ -86,7 +90,6 @@ jobs:
           path: luajit/ext
 
       - name: Apply cc-codecs core plumbing patch
-        shell: ${{ matrix.shell }}
         working-directory: luajit
         run: git apply --ignore-whitespace ext/cc-codecs-core-plumbing.patch
 

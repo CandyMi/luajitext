@@ -431,7 +431,8 @@ static uint32_t mp_count_entries(GCtab *t)
 /* Array prefix length: first index i >= 1 whose value is nil, minus one.
 ** The array part is scanned directly; when the array part is completely
 ** full the probe continues into the hash part with lj_tab_getint (keys at
-** or beyond asize can live there). */
+** or beyond asize can live there). That lookup takes an int32_t key, so the
+** probe cannot reach past INT32_MAX. */
 static uint32_t mp_prefix_len(GCtab *t)
 {
   uint32_t count = 0;
@@ -442,13 +443,14 @@ static uint32_t mp_prefix_len(GCtab *t)
     if (arr == NULL || tvisnil(&arr[i])) return count;
     count++;
   }
-  for (i = asize > 0 ? asize : 1; ; i++) {
-    cTValue *v = lj_tab_getint(t, i);
+  for (i = asize > 0 ? asize : 1; i <= (ptrdiff_t)INT32_MAX; i++) {
+    cTValue *v = lj_tab_getint(t, (int32_t)i);
     if (v == NULL || tvisnil(v)) return count;
     if (count >= (uint32_t)MP_MAX_COUNT)
       return (uint32_t)MP_MAX_COUNT;  /* Caller checks the cap. */
     count++;
   }
+  return count;  /* Unreachable unless asize > INT32_MAX: nothing to probe. */
 }
 
 /* Encode a plain (non-marker) object/map table by direct structural
@@ -484,9 +486,13 @@ static char *mp_put_map(lua_State *L, SBufExt *sbx, char *w, GCtab *t, GCtab *am
 	      w = mp_put_string(sbx, w, strV(k));
       } else {
         int32_t iv;
-        if (!mp_key_int(k, &iv))
+        /* mp_error raises, but lua_error carries no noreturn attribute, so
+        ** keep 'iv' strictly on the success path to avoid a spurious
+        ** "may be used uninitialized" warning. */
+        if (mp_key_int(k, &iv))
+          w = mp_put_sint64(sbx, w, (int64_t)iv);
+        else
           mp_error(L, "ccmsgpack.encode: unsupported map key type %s", mp_typename(k));
-        w = mp_put_sint64(sbx, w, (int64_t)iv);
       }
       w = mp_put_value(L, sbx, w, &node[i].val, amt, depth);
     }
@@ -508,7 +514,8 @@ static char *mp_put_array(lua_State *L, SBufExt *sbx, char *w, GCtab *t,
     mp_error(L, "ccmsgpack.encode: array too long");
   w = mp_put_len_header(sbx, w, count, 0);
   for (i = 1; i <= (ptrdiff_t)count; i++) {
-    cTValue *v = (i < asize) ? &arr[i] : lj_tab_getint(t, i);
+    /* count is capped at MP_MAX_COUNT (INT32_MAX), so the key fits. */
+    cTValue *v = (i < asize) ? &arr[i] : lj_tab_getint(t, (int32_t)i);
     w = mp_put_value(L, sbx, w, v, amt, depth);
   }
   return w;

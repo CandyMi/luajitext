@@ -1,0 +1,4 @@
+# cc-codecs-core-plumbing.patch is applied verbatim to a LuaJIT checkout:
+# the msvcbuild.bat hunks are CRLF (the file is stored that way in LuaJIT)
+# while every other hunk is LF. Never let git normalize its line endings.
+cc-codecs-core-plumbing.patch -text

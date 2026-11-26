@@ -1,5 +1,5 @@
 diff --git a/src/Makefile b/src/Makefile
-index 0b8c04f7..5a22281c 100644
+index 0b8c04f..73da521 100644
 --- a/src/Makefile
 +++ b/src/Makefile
 @@ -527,7 +527,7 @@ LJCORE_O= lj_assert.o lj_gc.o lj_err.o lj_char.o lj_bc.o lj_obj.o lj_buf.o \
@@ -11,9 +11,9 @@ index 0b8c04f7..5a22281c 100644
  
  LJVMCORE_O= $(LJVM_O) $(LJCORE_O)
  LJVMCORE_DYNO= $(LJVMCORE_O:.o=_dyn.o)
-@@ -734,6 +734,19 @@ $(HOST_O): %.o: %.c
- 
- include Makefile.dep
+@@ -732,6 +732,26 @@ $(HOST_O): %.o: %.c
+ 	$(E) "HOSTCC    $@"
+ 	$(Q)$(HOST_CC) $(HOST_ACFLAGS) -c -o $@ $<
  
 +# cc codecs: the module sources live in ../ext, not in src/. Bind the src
 +# objects to the ext sources and replicate the generic %.o rule (which
@@ -28,11 +28,18 @@ index 0b8c04f7..5a22281c 100644
 +	$(Q)$(TARGET_DYNCC) $(TARGET_ACFLAGS) -I. -c -o $(@:.o=_dyn.o) $<
 +	$(Q)$(TARGET_CC) $(TARGET_ACFLAGS) -I. -c -o $@ $<
 +
- ##############################################################################
- # Target file rules.
++# ljamalg.c pulls in ../ext/*.c; those includes resolve lua.h / lj_*.h
++# relative to their own directory, so amalg builds need -I. too.
++ljamalg.o: ljamalg.c
++	$(E) "CC        $@"
++	$(Q)$(TARGET_DYNCC) $(TARGET_ACFLAGS) -I. -c -o $(@:.o=_dyn.o) $<
++	$(Q)$(TARGET_CC) $(TARGET_ACFLAGS) -I. -c -o $@ $<
++
+ include Makefile.dep
+ 
  ##############################################################################
 diff --git a/src/lib_init.c b/src/lib_init.c
-index fb8138f2..26eec9b7 100644
+index fb8138f..7981112 100644
 --- a/src/lib_init.c
 +++ b/src/lib_init.c
 @@ -33,6 +33,8 @@ static const luaL_Reg lj_lib_preload[] = {
@@ -40,12 +47,12 @@ index fb8138f2..26eec9b7 100644
    { LUA_FFILIBNAME,	luaopen_ffi },
  #endif
 +  { "ccjson",		luaopen_ccjson },
-+  { "ccmsgpack",		luaopen_ccmsgpack },
++  { "ccmsgpack",	luaopen_ccmsgpack },
    { NULL,		NULL }
  };
  
 diff --git a/src/ljamalg.c b/src/ljamalg.c
-index 1dd96989..0bbae02f 100644
+index 1dd9698..0bbae02 100644
 --- a/src/ljamalg.c
 +++ b/src/ljamalg.c
 @@ -88,4 +88,7 @@
@@ -57,7 +64,7 @@ index 1dd96989..0bbae02f 100644
 +#include "../ext/yyjson.c"
  
 diff --git a/src/lualib.h b/src/lualib.h
-index f0d1642f..dec5ce2d 100644
+index f0d1642..dec5ce2 100644
 --- a/src/lualib.h
 +++ b/src/lualib.h
 @@ -34,6 +34,8 @@ LUALIB_API int luaopen_bit(lua_State *L);
@@ -70,10 +77,19 @@ index f0d1642f..dec5ce2d 100644
  LUALIB_API void luaL_openlibs(lua_State *L);
  
 diff --git a/src/msvcbuild.bat b/src/msvcbuild.bat
-index e0df88bc..6d86125b 100644
+index e0df88b..4fd7f0a 100644
 --- a/src/msvcbuild.bat
 +++ b/src/msvcbuild.bat
-@@ -110,14 +110,14 @@ buildvm -m folddef -o lj_folddef.h lj_opt_fold.c
+@@ -12,6 +12,8 @@
+ @rem   static        create static lib to statically link into your project
+ @rem   mixed         create static lib to build a DLL in your project
+ 
++@rem Always run from src/ so the relative paths below (..\dynasm, ..\ext, host\) resolve.
++@cd /d "%~dp0"
+ @if not defined INCLUDE goto :FAIL
+ 
+ @setlocal
+@@ -110,29 +112,29 @@ buildvm -m folddef -o lj_folddef.h lj_opt_fold.c
  @set LJLINK=%LJLINK% %LJLINKTYPE% %LJLINKTARGET%
  @if "%1"=="amalg" goto :AMALGDLL
  @if "%1"=="static" goto :STATIC
@@ -81,7 +97,8 @@ index e0df88bc..6d86125b 100644
 +%LJCOMPILE% %LJDYNBUILD% /I. lj_*.c lib_*.c ..\ext\yyjson.c ..\ext\lib_ccjson.c ..\ext\lib_ccmsgpack.c
  @if errorlevel 1 goto :BAD
  @if "%1"=="mixed" goto :STATICLIB
- %LJLINK% /DLL /OUT:%LJDLLNAME% lj_*.obj lib_*.obj
+-%LJLINK% /DLL /OUT:%LJDLLNAME% lj_*.obj lib_*.obj
++%LJLINK% /DLL /OUT:%LJDLLNAME% lj_*.obj lib_*.obj yyjson.obj
  @if errorlevel 1 goto :BAD
  @goto :MTDLL
  :STATIC
@@ -89,4 +106,22 @@ index e0df88bc..6d86125b 100644
 +%LJCOMPILE% /I. lj_*.c lib_*.c ..\ext\yyjson.c ..\ext\lib_ccjson.c ..\ext\lib_ccmsgpack.c
  @if errorlevel 1 goto :BAD
  :STATICLIB
- %LJLIB% /OUT:%LJLIBNAME% lj_*.obj lib_*.obj
+-%LJLIB% /OUT:%LJLIBNAME% lj_*.obj lib_*.obj
++%LJLIB% /OUT:%LJLIBNAME% lj_*.obj lib_*.obj yyjson.obj
+ @if errorlevel 1 goto :BAD
+ @goto :MTDLL
+ :AMALGDLL
+ @if "%2"=="static" goto :AMALGSTATIC
+-%LJCOMPILE% %LJDYNBUILD% ljamalg.c
++%LJCOMPILE% %LJDYNBUILD% /I. ljamalg.c
+ @if errorlevel 1 goto :BAD
+ @if "%2"=="mixed" goto :AMALGSTATICLIB
+ %LJLINK% /DLL /OUT:%LJDLLNAME% ljamalg.obj lj_vm.obj
+ @if errorlevel 1 goto :BAD
+ @goto :MTDLL
+ :AMALGSTATIC
+-%LJCOMPILE% ljamalg.c
++%LJCOMPILE% /I. ljamalg.c
+ @if errorlevel 1 goto :BAD
+ :AMALGSTATICLIB
+ %LJLIB% /OUT:%LJLIBNAME% ljamalg.obj lj_vm.obj

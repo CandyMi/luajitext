@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      luajit-ref:
+        description: LuaJIT branch or tag to build against
+        required: false
+        default: v2.1
+
+permissions:
+  contents: read
+
+env:
+  LUAJIT_REPOSITORY: LuaJIT/LuaJIT
+  LUAJIT_REF: ${{ inputs['luajit-ref'] || 'v2.1' }}
+
+jobs:
+  linux:
+    name: Linux / GNU make
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout LuaJIT
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LUAJIT_REPOSITORY }}
+          ref: ${{ env.LUAJIT_REF }}
+          path: luajit
+
+      - name: Checkout luajitext as luajit/ext
+        uses: actions/checkout@v4
+        with:
+          path: luajit/ext
+
+      - name: Apply cc-codecs core plumbing patch
+        working-directory: luajit
+        run: git apply --ignore-whitespace ext/cc-codecs-core-plumbing.patch
+
+      - name: Build (default)
+        working-directory: luajit
+        run: make
+
+      - name: Test (default)
+        working-directory: luajit
+        run: |
+          src/luajit ext/tests/test_json.lua
+          src/luajit ext/tests/test_msgpack.lua
+
+      - name: Build (amalgamation)
+        working-directory: luajit
+        run: make clean && make amalg
+
+      - name: Test (amalgamation)
+        working-directory: luajit
+        run: |
+          src/luajit ext/tests/test_json.lua
+          src/luajit ext/tests/test_msgpack.lua
+
+  windows:
+    name: Windows / ${{ matrix.shell }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [cmd, pwsh]
+    steps:
+      # The patch carries CRLF lines for msvcbuild.bat, and every other hunk
+      # expects LF sources: check out both repos byte-for-byte.
+      - name: Keep original line endings
+        shell: ${{ matrix.shell }}
+        run: git config --global core.autocrlf false
+
+      - name: Checkout LuaJIT
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LUAJIT_REPOSITORY }}
+          ref: ${{ env.LUAJIT_REF }}
+          path: luajit
+
+      - name: Checkout luajitext as luajit/ext
+        uses: actions/checkout@v4
+        with:
+          path: luajit/ext
+
+      - name: Apply cc-codecs core plumbing patch
+        shell: ${{ matrix.shell }}
+        working-directory: luajit
+        run: git apply --ignore-whitespace ext/cc-codecs-core-plumbing.patch
+
+      - name: Set up MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build with msvcbuild.bat (cmd)
+        if: matrix.shell == 'cmd'
+        shell: cmd
+        working-directory: luajit/src
+        run: |
+          call msvcbuild.bat
+          if errorlevel 1 exit /b 1
+
+      - name: Build with msvcbuild.bat (pwsh)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        working-directory: luajit/src
+        run: |
+          cmd /c msvcbuild.bat
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test (cmd)
+        if: matrix.shell == 'cmd'
+        shell: cmd
+        working-directory: luajit
+        run: |
+          src\luajit.exe ext\tests\test_json.lua
+          if errorlevel 1 exit /b 1
+          src\luajit.exe ext\tests\test_msgpack.lua
+          if errorlevel 1 exit /b 1
+
+      - name: Test (pwsh)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        working-directory: luajit
+        run: |
+          .\src\luajit.exe ext\tests\test_json.lua
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\src\luajit.exe ext\tests\test_msgpack.lua
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
